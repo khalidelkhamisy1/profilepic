@@ -3,16 +3,109 @@ import { useState, useRef, useCallback, useEffect } from "react";
 // ===== Constants =====
 const EXPORT_SIZE = 1080; // Final export dimensions (1080x1080)
 const ACCEPTED_TYPES = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
-const MIN_ZOOM = 1;
-const MAX_ZOOM = 3;
+const MIN_ZOOM = 1;   // 1× = exact cover (image fills the square perfectly)
+const MAX_ZOOM = 3;   // 3× = zoomed in 3× past cover
 const DEFAULT_ZOOM = 1;
+
+// =====================================================================
+// HELPER FUNCTIONS — cover-scale, display rect, clamping, canvas draw
+// =====================================================================
+
+/**
+ * Calculate the base scale needed to "cover" a square of `squareSize`
+ * with an image of `naturalWidth × naturalHeight`, preserving aspect ratio.
+ *
+ * This is the CSS `object-fit: cover` equivalent:
+ *   pick the LARGER of (squareSize/w) and (squareSize/h)
+ *   so the shorter dimension fills the square and the longer overflows.
+ */
+function calculateCoverScale(naturalWidth, naturalHeight, squareSize) {
+  return Math.max(squareSize / naturalWidth, squareSize / naturalHeight);
+}
+
+/**
+ * Return the displayed width, height, x, y of the user image
+ * given image natural size, squareSize, zoom multiplier, and offsets.
+ *
+ * displayedWidth  = naturalWidth  × baseScale × zoom
+ * displayedHeight = naturalHeight × baseScale × zoom
+ * x = squareSize/2 + offsetX − displayedWidth/2
+ * y = squareSize/2 + offsetY − displayedHeight/2
+ */
+function getDisplayedImageRect(naturalWidth, naturalHeight, squareSize, zoom, offsetX, offsetY) {
+  const baseScale = calculateCoverScale(naturalWidth, naturalHeight, squareSize);
+  const displayedWidth = naturalWidth * baseScale * zoom;
+  const displayedHeight = naturalHeight * baseScale * zoom;
+  const x = squareSize / 2 + offsetX - displayedWidth / 2;
+  const y = squareSize / 2 + offsetY - displayedHeight / 2;
+  return { x, y, width: displayedWidth, height: displayedHeight };
+}
+
+/**
+ * Clamp offsetX and offsetY so the image never leaves blank areas
+ * inside the square. The image edges must always reach or exceed
+ * the square edges.
+ *
+ * maxOffsetX = max(0, (displayedWidth  − squareSize) / 2)
+ * maxOffsetY = max(0, (displayedHeight − squareSize) / 2)
+ */
+function clampOffsets(offsetX, offsetY, naturalWidth, naturalHeight, squareSize, zoom) {
+  const baseScale = calculateCoverScale(naturalWidth, naturalHeight, squareSize);
+  const displayedWidth = naturalWidth * baseScale * zoom;
+  const displayedHeight = naturalHeight * baseScale * zoom;
+  const maxOffsetX = Math.max(0, (displayedWidth - squareSize) / 2);
+  const maxOffsetY = Math.max(0, (displayedHeight - squareSize) / 2);
+  return {
+    x: Math.max(-maxOffsetX, Math.min(maxOffsetX, offsetX)),
+    y: Math.max(-maxOffsetY, Math.min(maxOffsetY, offsetY)),
+  };
+}
+
+/**
+ * Draw the composited image (user photo + frame) onto a canvas at `size × size`.
+ * Uses the exact same cover-scale / offset maths as the preview so the
+ * export matches pixel-for-pixel.
+ */
+async function drawCanvas(canvas, imageEl, zoom, offset, size) {
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, size, size);
+
+  // 1) Draw the user's photo at the correct cover-scaled position
+  const rect = getDisplayedImageRect(
+    imageEl.naturalWidth,
+    imageEl.naturalHeight,
+    size,
+    zoom,
+    // Scale the offsets from preview-space → export-space
+    // (offsets are stored in preview-pixel units, so we need to convert)
+    offset.x,
+    offset.y
+  );
+  ctx.drawImage(imageEl, rect.x, rect.y, rect.width, rect.height);
+
+  // 2) Draw the transparent frame above it
+  const frameImg = new Image();
+  frameImg.crossOrigin = "anonymous";
+  await new Promise((resolve, reject) => {
+    frameImg.onload = resolve;
+    frameImg.onerror = reject;
+    frameImg.src = "/frame.png";
+  });
+  ctx.drawImage(frameImg, 0, 0, size, size);
+}
+
+// =====================================================================
+// COMPONENT
+// =====================================================================
 
 export default function App() {
   // ===== State =====
-  const [image, setImage] = useState(null); // User's uploaded image URL
-  const [imageEl, setImageEl] = useState(null); // Loaded HTMLImageElement
+  const [image, setImage] = useState(null);       // User's uploaded image blob URL
+  const [imageEl, setImageEl] = useState(null);    // Loaded HTMLImageElement
   const [zoom, setZoom] = useState(DEFAULT_ZOOM);
-  const [offset, setOffset] = useState({ x: 0, y: 0 }); // Drag offset
+  const [offset, setOffset] = useState({ x: 0, y: 0 }); // Drag offset (in preview-pixel units)
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [loading, setLoading] = useState(false);
@@ -33,6 +126,13 @@ export default function App() {
     }
   }, [error]);
 
+  // ===== Re-clamp offsets whenever zoom changes =====
+  useEffect(() => {
+    if (!imageEl || !previewRef.current) return;
+    const squareSize = previewRef.current.offsetWidth;
+    setOffset((prev) => clampOffsets(prev.x, prev.y, imageEl.naturalWidth, imageEl.naturalHeight, squareSize, zoom));
+  }, [zoom, imageEl]);
+
   // ===== Validate and process uploaded file =====
   const processFile = useCallback((file) => {
     if (!file) return;
@@ -51,6 +151,12 @@ export default function App() {
 
     setLoading(true);
     setError(null);
+
+    // Revoke previous object URL if any
+    setImage((prevUrl) => {
+      if (prevUrl) URL.revokeObjectURL(prevUrl);
+      return null;
+    });
 
     const url = URL.createObjectURL(file);
     const img = new Image();
@@ -72,11 +178,10 @@ export default function App() {
   // ===== Handle file input change =====
   const handleFileChange = (e) => {
     processFile(e.target.files[0]);
-    // Reset input so user can re-upload the same file
-    e.target.value = "";
+    e.target.value = ""; // Reset so re-uploading the same file works
   };
 
-  // ===== Handle drag and drop =====
+  // ===== Handle drag-and-drop upload =====
   const handleDrop = (e) => {
     e.preventDefault();
     setDragOver(false);
@@ -107,13 +212,15 @@ export default function App() {
   };
 
   const handlePointerMove = (e) => {
-    if (!isDragging) return;
+    if (!isDragging || !imageEl || !previewRef.current) return;
     e.preventDefault();
     const pos = getPointerPos(e);
-    setOffset({
-      x: pos.x - dragStart.x,
-      y: pos.y - dragStart.y,
-    });
+    const rawX = pos.x - dragStart.x;
+    const rawY = pos.y - dragStart.y;
+    // Clamp immediately so blank areas never appear while dragging
+    const squareSize = previewRef.current.offsetWidth;
+    const clamped = clampOffsets(rawX, rawY, imageEl.naturalWidth, imageEl.naturalHeight, squareSize, zoom);
+    setOffset(clamped);
   };
 
   const handlePointerUp = () => setIsDragging(false);
@@ -124,83 +231,46 @@ export default function App() {
     setOffset({ x: 0, y: 0 });
   };
 
-  // ===== Compute transform for the user's photo in preview =====
+  // ===== Compute inline style for the user's photo in preview =====
   const getPhotoStyle = () => {
     if (!imageEl || !previewRef.current) return {};
-    const containerSize = previewRef.current.offsetWidth;
-
-    // Calculate cover dimensions
-    const imgAspect = imageEl.naturalWidth / imageEl.naturalHeight;
-    let drawW, drawH;
-    if (imgAspect > 1) {
-      // Landscape: height fills, width overflows
-      drawH = containerSize * zoom;
-      drawW = drawH * imgAspect;
-    } else {
-      // Portrait or square: width fills, height overflows
-      drawW = containerSize * zoom;
-      drawH = drawW / imgAspect;
-    }
-
-    const offsetX = (containerSize - drawW) / 2 + offset.x;
-    const offsetY = (containerSize - drawH) / 2 + offset.y;
-
+    const squareSize = previewRef.current.offsetWidth;
+    const rect = getDisplayedImageRect(
+      imageEl.naturalWidth,
+      imageEl.naturalHeight,
+      squareSize,
+      zoom,
+      offset.x,
+      offset.y
+    );
     return {
       position: "absolute",
-      width: `${drawW}px`,
-      height: `${drawH}px`,
-      left: `${offsetX}px`,
-      top: `${offsetY}px`,
+      width: `${rect.width}px`,
+      height: `${rect.height}px`,
+      left: `${rect.x}px`,
+      top: `${rect.y}px`,
       pointerEvents: "none",
     };
   };
 
   // ===== Export final image using Canvas =====
   const handleDownload = async () => {
-    if (!imageEl) return;
+    if (!imageEl || !previewRef.current) return;
     setExporting(true);
 
     try {
-      const canvas = canvasRef.current;
-      canvas.width = EXPORT_SIZE;
-      canvas.height = EXPORT_SIZE;
-      const ctx = canvas.getContext("2d");
+      const previewSize = previewRef.current.offsetWidth;
+      // Scale offsets from preview-space → export-space so crop matches
+      const scaleFactor = EXPORT_SIZE / previewSize;
+      const exportOffset = {
+        x: offset.x * scaleFactor,
+        y: offset.y * scaleFactor,
+      };
 
-      // Clear canvas
-      ctx.clearRect(0, 0, EXPORT_SIZE, EXPORT_SIZE);
+      await drawCanvas(canvasRef.current, imageEl, zoom, exportOffset, EXPORT_SIZE);
 
-      // Calculate the user's photo draw dimensions at export scale
-      const containerSize = previewRef.current.offsetWidth;
-      const scale = EXPORT_SIZE / containerSize;
-
-      const imgAspect = imageEl.naturalWidth / imageEl.naturalHeight;
-      let drawW, drawH;
-      if (imgAspect > 1) {
-        drawH = EXPORT_SIZE * zoom;
-        drawW = drawH * imgAspect;
-      } else {
-        drawW = EXPORT_SIZE * zoom;
-        drawH = drawW / imgAspect;
-      }
-
-      const drawX = (EXPORT_SIZE - drawW) / 2 + offset.x * scale;
-      const drawY = (EXPORT_SIZE - drawH) / 2 + offset.y * scale;
-
-      // 1) Draw the user's photo first
-      ctx.drawImage(imageEl, drawX, drawY, drawW, drawH);
-
-      // 2) Draw the frame above it
-      const frameImg = new Image();
-      frameImg.crossOrigin = "anonymous";
-      await new Promise((resolve, reject) => {
-        frameImg.onload = resolve;
-        frameImg.onerror = reject;
-        frameImg.src = "/frame.png";
-      });
-      ctx.drawImage(frameImg, 0, 0, EXPORT_SIZE, EXPORT_SIZE);
-
-      // 3) Export as PNG
-      const dataUrl = canvas.toDataURL("image/png");
+      // Trigger download
+      const dataUrl = canvasRef.current.toDataURL("image/png");
       const link = document.createElement("a");
       link.download = "profile-frame.png";
       link.href = dataUrl;
@@ -307,14 +377,14 @@ export default function App() {
               style={{ cursor: isDragging ? "grabbing" : "grab" }}
               id="preview-area"
             >
-              {/* User's photo */}
+              {/* User's photo — cover-scaled, draggable, zoomable */}
               <img
                 src={image}
                 alt="Your uploaded photo"
                 style={getPhotoStyle()}
                 draggable={false}
               />
-              {/* Frame overlay */}
+              {/* Frame overlay — fixed, always fills the square */}
               <img
                 src="/frame.png"
                 alt="Frame overlay"
